@@ -1,5 +1,7 @@
 # DivLM
 
+Training and evaluation code for DivLM.
+
 ## Structure
 
 ```text
