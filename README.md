@@ -18,9 +18,9 @@ pip install -r requirements.txt --extra-index-url https://download.pytorch.org/w
 
 ## Data Formats
 
-The CPT and GRPO training datasets must be HuggingFace datasets saved with `save_to_disk` containing a "text" column and a "prompt" column respectively.
+The CPT and GRPO training datasets must be HuggingFace datasets saved with `save_to_disk` containing a "text" field and a "prompt" field respectively.
 
-Evaluation data can be either a JSON file or a HuggingFace dataset. It must contain a "prompt" column.
+Evaluation data can be either a JSON file or a HuggingFace dataset. It must contain a "prompt" field.
 
 ## Main Commands
 
