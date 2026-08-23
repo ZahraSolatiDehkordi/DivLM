@@ -1,6 +1,6 @@
-# DivLM
+# Improving Diversity in LLM Short Story Generation (DivLM)
 
-Training and evaluation code for DivLM.
+This repository contains the implementation of the paper [...].
 
 ## Structure
 
