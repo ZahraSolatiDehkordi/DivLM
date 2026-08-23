@@ -1,7 +1,5 @@
 # DivLM
 
-This folder contains the training and evaluation code for DivLM.
-
 ## Structure
 
 ```text
