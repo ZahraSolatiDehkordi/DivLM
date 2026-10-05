@@ -1,6 +1,6 @@
 # Improving Diversity in LLM Short Story Generation (DivLM)
 
-This repository contains the implementation of the paper [...].
+This repository contains the implementation of the paper "Improving Diversity in LLM Short Story Generation".
 
 ## Structure
 
