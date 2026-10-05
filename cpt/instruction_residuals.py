@@ -57,9 +57,13 @@ def load_instruction_residual(base_model, instruct_model, residual_path):
 
 def apply_instruction_residual(model, residual, scale):
     state = model.state_dict()
+    updated_tensors = set()
     with torch.no_grad():
         for key, tensor in state.items():
             if key not in residual:
+                continue
+            tensor_key = (tensor.device, tensor.data_ptr(), tensor.shape, tensor.stride())
+            if tensor_key in updated_tensors:
                 continue
             tensor.copy_(
                 tensor + scale * residual[key].to(
@@ -67,6 +71,7 @@ def apply_instruction_residual(model, residual, scale):
                     dtype=tensor.dtype,
                 )
             )
+            updated_tensors.add(tensor_key)
 
 
 parser = argparse.ArgumentParser(description="Apply an instruction residual to a CPT adapter.")
