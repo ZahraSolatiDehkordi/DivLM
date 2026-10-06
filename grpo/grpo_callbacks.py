@@ -2,6 +2,20 @@ import os
 import time
 
 from transformers import TrainerCallback
+from transformers.trainer_callback import PrinterCallback, ProgressCallback
+
+
+class QuietProgressCallback(ProgressCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        return control
+
+
+def configure_training_progress(trainer):
+    trainer.remove_callback(PrinterCallback)
+    trainer.remove_callback(ProgressCallback)
+    if not trainer.args.disable_tqdm:
+        trainer.add_callback(QuietProgressCallback())
+
 
 class MilestoneCheckpointCallback(TrainerCallback):
     def __init__(self, save_steps, adapter_dir):

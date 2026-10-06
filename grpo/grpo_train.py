@@ -22,9 +22,12 @@ if str(ROOT_DIR) not in sys.path:
 
 from common import config as cfg
 from common import utils as common_utils
-from common.utils import divlm_source_tag, is_complete_adapter_dir, make_run_name, safe_wandb_call, set_all_seeds
+from common.utils import (
+    divlm_source_tag, is_complete_adapter_dir, make_run_name, safe_wandb_call,
+    set_all_seeds, validate_grpo_generation_batch_size,
+)
 from grpo import grpo_callbacks, grpo_generation, grpo_judge, grpo_reward, grpo_monitor
-from grpo.grpo_callbacks import MilestoneCheckpointCallback
+from grpo.grpo_callbacks import MilestoneCheckpointCallback, configure_training_progress
 from grpo.grpo_generation import format_prompt, get_generation_eos_token_id, make_system_prompt
 from grpo.grpo_reward import FinalReward
 from grpo.grpo_monitor import (
@@ -179,6 +182,20 @@ global_rank = int(os.environ.get("RANK", 0))
 world_size = int(os.environ.get("WORLD_SIZE", 1))
 is_main_process = global_rank == 0
 
+num_gpus = torch.cuda.device_count()
+GENERATION_BATCH_SIZE = (
+    int(args.generation_batch_size)
+    if args.generation_batch_size is not None
+    else (
+        cfg.TRAIN_GENERATION_BATCH_SIZE_MULTI_GPU
+        if num_gpus > 1
+        else cfg.TRAIN_GENERATION_BATCH_SIZE_SINGLE_GPU
+    )
+)
+validate_grpo_generation_batch_size(
+    GENERATION_BATCH_SIZE, world_size, GROUP_SIZE, PER_DEVICE_TRAIN_BATCH_SIZE,
+)
+
 if torch.cuda.is_available():
     torch.cuda.set_device(local_rank)
 
@@ -193,6 +210,9 @@ if final_adapter_exists:
 
 tokenizer = AutoTokenizer.from_pretrained(base_model, use_fast=True)
 tokenizer.padding_side = "left"
+
+if tokenizer.eos_token_id is None:
+    raise ValueError("GRPO requires a tokenizer EOS token for generation and completion masking.")
 
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
@@ -279,9 +299,8 @@ if len(tokenizer) > model.config.vocab_size:
 
 model.config.pad_token_id = tokenizer.pad_token_id
 model.generation_config.pad_token_id = tokenizer.pad_token_id
-if model.generation_config.eos_token_id is None:
-    model.generation_config.eos_token_id = tokenizer.eos_token_id
 generation_eos_token_id = get_generation_eos_token_id(model, tokenizer)
+model.generation_config.eos_token_id = generation_eos_token_id
 
 train_ds = load_from_disk(ds_path)
 
@@ -405,16 +424,6 @@ lora_config = LoraConfig(
 model_with_lora = get_peft_model(model, lora_config)
 model_with_lora.print_trainable_parameters()
 
-num_gpus = torch.cuda.device_count()
-GENERATION_BATCH_SIZE = (
-    int(args.generation_batch_size)
-    if args.generation_batch_size is not None
-    else (
-        cfg.TRAIN_GENERATION_BATCH_SIZE_MULTI_GPU
-        if num_gpus > 1
-        else cfg.TRAIN_GENERATION_BATCH_SIZE_SINGLE_GPU
-    )
-)
 print(f"\n{'=' * 80}")
 print(f"GPU Configuration:")
 print(f"  Available GPUs: {num_gpus}")
@@ -441,7 +450,7 @@ training_args = GRPOConfig(
     gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
     learning_rate=GRPO_LEARNING_RATE,
     lr_scheduler_type="cosine",
-    logging_steps=100,
+    logging_steps=cfg.MONITOR_CHECK_EVERY,
 
     generation_kwargs={
         "max_new_tokens": MAX_NEW_TOKENS,
@@ -450,7 +459,7 @@ training_args = GRPOConfig(
         "top_k": GEN_TOP_K,
         "do_sample": True,
         "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": generation_eos_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
         "repetition_penalty": cfg.GEN_REPETITION_PENALTY,
 
     },
@@ -529,6 +538,7 @@ trainer = GRPOTrainer(
     processing_class=tokenizer,
     callbacks=[milestone_callback, monitor_callback]
 )
+configure_training_progress(trainer)
 
 config_dict = training_args.to_dict()
 config_dict.update({

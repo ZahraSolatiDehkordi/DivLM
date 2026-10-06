@@ -12,7 +12,10 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from common import config as cfg
-from common.utils import env_int, make_run_name, safe_wandb_call, save_json, set_all_seeds, source_tag
+from common.utils import (
+    env_int, load_adapter_training_config, make_run_name, resolve_entity_h,
+    safe_wandb_call, save_json, set_all_seeds, source_tag, validate_adapter_base,
+)
 from grpo.grpo_eval_core import (
     evaluate_outputs,
     latest_adapter_target,
@@ -48,7 +51,7 @@ parser.add_argument(
     default=cfg.EVAL_GENERATION_BATCH_SIZE,
 )
 parser.add_argument("--judge-batch-size", type=int, default=cfg.JUDGE_BATCH_SIZE)
-parser.add_argument("--h", type=float, default=cfg.ENTITY_H)
+parser.add_argument("--h", type=float, default=None, help="Override saved training h; otherwise use it, or 5 if absent.")
 parser.add_argument("--length-penalty", type=str, choices=("true", "false"), default="true")
 parser.add_argument("--quality-gate", type=str, choices=("true", "false"), default="true")
 parser.add_argument("--group-quality-tau", type=float, default=cfg.GROUP_QUALITY_TAU)
@@ -120,6 +123,7 @@ def generate_full_model_outputs(model_key, source, plain_prompts, generation_set
             use_transformers=True,
             deterministic_algorithms=True,
             set_cublas_workspace=True,
+            disable_tf32=True,
         ),
     )
     tokenizer_source = getattr(tokenizer, "name_or_path", source)
@@ -145,6 +149,7 @@ def generate_adapter_outputs(adapter_target, plain_prompts, generation_settings,
             use_transformers=True,
             deterministic_algorithms=True,
             set_cublas_workspace=True,
+            disable_tf32=True,
         ),
     )
     resolved_tokenizer_source = getattr(tokenizer, "name_or_path", tokenizer_source)
@@ -153,16 +158,21 @@ def generate_adapter_outputs(adapter_target, plain_prompts, generation_settings,
 
 
 def main():
+    adapter_target = latest_adapter_target(args.adapter_dir)
+    training_config = load_adapter_training_config(adapter_target)
+    validate_adapter_base(args.cpt_base, adapter_target, training_config)
+    args.h = resolve_entity_h(args.h, training_config, cfg.ENTITY_H)
+    print(f"Named entity sensitivity h: {args.h}")
     validate_args()
     set_all_seeds(
         args.seed,
         use_transformers=True,
         deterministic_algorithms=True,
         set_cublas_workspace=True,
+        disable_tf32=True,
     )
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    adapter_target = latest_adapter_target(args.adapter_dir)
     run_name = args.run_name or make_run_name(
         source_tag(args.adapter_dir),
         source_tag(args.test_set_path),
@@ -299,11 +309,12 @@ def main():
     print(f"Saved metrics to {results_path}")
 
     if wandb_run is not None:
-        metrics_table = wandb.Table(
+        metrics_table = safe_wandb_call(lambda: wandb.Table(
             columns=["Metric", *model_keys],
             data=model_table_rows(results_by_model, model_keys),
-        )
-        safe_wandb_call(lambda: wandb.log({"metrics_table": metrics_table}), "table log")
+        ), "table creation")
+        if metrics_table is not None:
+            safe_wandb_call(lambda: wandb.log({"metrics_table": metrics_table}), "table log")
         safe_wandb_call(lambda: wandb.finish(), "finish")
 
 

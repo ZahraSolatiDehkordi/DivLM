@@ -332,6 +332,12 @@ Respond only with a JSON object in this exact format, using lowercase booleans:
         return results
 
     def extract_prompt_q_batch(self, prompts: List[str]) -> List[set]:
+        results = []
+        for start in range(0, len(prompts), self.max_batch_size):
+            results.extend(self._extract_prompt_q_batch(prompts[start:start + self.max_batch_size]))
+        return results
+
+    def _extract_prompt_q_batch(self, prompts: List[str]) -> List[set]:
         system_prompt = """You are a named entity extractor.
 
     Extract ONLY specific proper nouns from the given text:

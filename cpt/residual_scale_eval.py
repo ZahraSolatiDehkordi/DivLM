@@ -125,6 +125,7 @@ def generate_model_outputs(model_key, source, plain_prompts, generation_settings
             use_transformers=True,
             deterministic_algorithms=True,
             set_cublas_workspace=True,
+            disable_tf32=True,
         ),
     )
     tokenizer_source = getattr(tokenizer, "name_or_path", source)
@@ -139,6 +140,7 @@ def main():
         use_transformers=True,
         deterministic_algorithms=True,
         set_cublas_workspace=True,
+        disable_tf32=True,
     )
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -276,11 +278,12 @@ def main():
     print(f"Saved metrics to {results_path}")
 
     if wandb_run is not None:
-        metrics_table = wandb.Table(
+        metrics_table = safe_wandb_call(lambda: wandb.Table(
             columns=["Metric", *model_keys],
             data=model_table_rows(results_by_model, model_keys),
-        )
-        safe_wandb_call(lambda: wandb.log({"metrics_table": metrics_table}), "table log")
+        ), "table creation")
+        if metrics_table is not None:
+            safe_wandb_call(lambda: wandb.log({"metrics_table": metrics_table}), "table log")
         safe_wandb_call(lambda: wandb.finish(), "finish")
 
 

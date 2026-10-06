@@ -11,7 +11,7 @@ from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from common import config as cfg
-from common.utils import is_complete_adapter_dir
+from common.utils import is_complete_adapter_dir, validate_adapter_base
 
 
 METRICS = [
@@ -162,6 +162,7 @@ def tokenizer_source_for_adapter(adapter_target, cpt_base):
 
 
 def load_adapter_model(cpt_base, adapter_target, tokenizer, device):
+    validate_adapter_base(cpt_base, adapter_target)
     base = load_causal_lm(cpt_base, tokenizer, device)
     model = PeftModel.from_pretrained(base, adapter_target)
     model.eval()

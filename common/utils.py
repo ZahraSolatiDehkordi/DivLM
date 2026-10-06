@@ -1,7 +1,9 @@
 import json
+import math
 import os
 import random
 import re
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -22,6 +24,16 @@ def env_int(name, default):
         return default
 
 
+def validate_grpo_generation_batch_size(batch_size, world_size, group_size, per_device_batch_size):
+    multiple = world_size * math.lcm(group_size, per_device_batch_size)
+    if batch_size % multiple:
+        raise ValueError(
+            f"GRPO generation batch size {batch_size} must be a multiple of {multiple} "
+            f"for {world_size} process(es), groups of {group_size}, and per-device batch size "
+            f"{per_device_batch_size}. Each process must receive complete generation groups."
+        )
+
+
 def is_main_process():
     return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
 
@@ -32,6 +44,7 @@ def set_all_seeds(
     use_transformers=False,
     deterministic_algorithms=False,
     set_cublas_workspace=False,
+    disable_tf32=False,
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -44,6 +57,9 @@ def set_all_seeds(
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+    if disable_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     if deterministic_algorithms and hasattr(torch, "use_deterministic_algorithms"):
         torch.use_deterministic_algorithms(True, warn_only=True)
 
@@ -107,10 +123,75 @@ def divlm_source_tag(cpt_base):
 def is_complete_adapter_dir(path):
     if not path or not os.path.isdir(path):
         return False
-    if not os.path.exists(os.path.join(path, "adapter_config.json")):
+    try:
+        with open(os.path.join(path, "adapter_config.json"), encoding="utf-8") as handle:
+            config = json.load(handle)
+        if not isinstance(config, dict) or not config:
+            return False
+        weights_path = os.path.join(path, "adapter_model.safetensors")
+        if os.path.isfile(weights_path):
+            from safetensors import safe_open
+            with safe_open(weights_path, framework="pt", device="cpu") as weights:
+                return bool(weights.keys())
+        weights_path = os.path.join(path, "adapter_model.bin")
+        if os.path.isfile(weights_path):
+            weights = torch.load(weights_path, map_location="cpu", weights_only=True)
+            return isinstance(weights, dict) and bool(weights) and all(
+                isinstance(value, torch.Tensor) for value in weights.values()
+            )
+    except (OSError, ValueError, RuntimeError, EOFError):
         return False
-    adapter_weights = (
-        "adapter_model.safetensors",
-        "adapter_model.bin",
-    )
-    return any(os.path.exists(os.path.join(path, name)) for name in adapter_weights)
+    except Exception as exc:
+        print(f"Could not validate adapter at {path}: {exc}")
+        return False
+    return False
+
+
+def load_adapter_training_config(adapter_target):
+    target = Path(adapter_target).resolve()
+    candidates = [target]
+    if re.fullmatch(r"(?:checkpoint|milestone)-\d+", target.name):
+        candidates.append(target.parent)
+        if target.parent.name in {"checkpoints", "milestones"}:
+            candidates.append(target.parent.parent)
+    elif target.name == "adapter":
+        candidates.append(target.parent)
+    for directory in candidates:
+        path = directory / "full_config.json"
+        if path.is_file():
+            with path.open(encoding="utf-8") as handle:
+                config = json.load(handle)
+            if not isinstance(config, dict):
+                raise ValueError(f"Training configuration must be a JSON object: {path}")
+            return config
+    return {}
+
+
+def validate_adapter_base(cpt_base, adapter_target, training_config=None):
+    if training_config is None:
+        training_config = load_adapter_training_config(adapter_target)
+    recorded_base = training_config.get("base_model")
+    if not recorded_base:
+        with open(os.path.join(adapter_target, "adapter_config.json"), encoding="utf-8") as handle:
+            recorded_base = json.load(handle).get("base_model_name_or_path")
+    if not recorded_base:
+        print("Warning: no saved adapter base is available for a consistency check.")
+        return
+    expected = os.path.normcase(os.path.realpath(os.path.expanduser(str(recorded_base))))
+    supplied = os.path.normcase(os.path.realpath(os.path.expanduser(str(cpt_base))))
+    if expected != supplied:
+        raise ValueError(
+            f"Adapter base mismatch: training used {recorded_base!r}, but --cpt-base is {cpt_base!r}. "
+            "Use the training base model. If it was moved, update its saved path in full_config.json "
+            "(or adapter_config.json when no training configuration exists)."
+        )
+
+
+def resolve_entity_h(override, training_config, default):
+    value = override
+    if value is None:
+        value = training_config.get("h", training_config.get("entity_harshness", default))
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("Named entity sensitivity h must be finite and non-negative.")
+    return value

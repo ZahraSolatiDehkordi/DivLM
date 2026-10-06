@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -10,6 +11,8 @@ from datetime import datetime
 import numpy as np
 import torch
 from transformers import TrainerCallback
+
+from common.utils import is_complete_adapter_dir
 
 
 @dataclass
@@ -52,11 +55,25 @@ def checkpoint_step(path):
     return int(match.group(1)) if match else None
 
 
+def checkpoint_is_resumable(path):
+    if not path or not is_complete_adapter_dir(path):
+        return False
+    step = checkpoint_step(path)
+    if step is None:
+        return False
+    try:
+        with open(os.path.join(path, "trainer_state.json"), encoding="utf-8") as handle:
+            state = json.load(handle)
+        return isinstance(state, dict) and state.get("global_step") == step
+    except (OSError, ValueError):
+        return False
+
+
 def find_checkpoints(adapter_dir):
     checkpoint_candidates = []
     for checkpoint_path in glob.glob(os.path.join(adapter_dir, "checkpoint-*")):
         step = checkpoint_step(checkpoint_path)
-        if step is not None:
+        if step is not None and checkpoint_is_resumable(checkpoint_path):
             checkpoint_candidates.append((step, checkpoint_path))
     return sorted(checkpoint_candidates, key=lambda item: item[0])
 
@@ -83,7 +100,7 @@ def resolve_resume_checkpoint(adapter_dir, config, is_main_process=True):
     if config.enabled and monitor_state.get("status") == "collapse_detected":
         rollback_path = monitor_state.get("resume_from_checkpoint") or monitor_state.get("rollback_checkpoint")
         rollback_step = checkpoint_step(rollback_path) if rollback_path else None
-        if rollback_path and rollback_step is not None and os.path.isdir(rollback_path):
+        if rollback_path and rollback_step is not None and checkpoint_is_resumable(rollback_path):
             resume_step, resume_from = rollback_step, rollback_path
             resume_reason = "collapse monitor rollback checkpoint"
         elif is_main_process:
@@ -100,10 +117,37 @@ def create_monitor_callback(adapter_dir, config, is_main_process, reward_history
     return CollapseMonitorCallback(
         adapter_dir=adapter_dir,
         config=config,
-        enabled=config.enabled and is_main_process,
+        enabled=config.enabled,
         is_main_process=is_main_process,
         reward_history=reward_history,
     )
+
+
+def run_command_with_monitor(command, checkpoint_dir, config, run_command):
+    while True:
+        previous = load_monitor_state(checkpoint_dir, config)
+        try:
+            return run_command(command)
+        except subprocess.CalledProcessError as exc:
+            state = load_monitor_state(checkpoint_dir, config)
+            previous_count = int(previous.get("restart_count", 0))
+            restart_count = int(state.get("restart_count", 0))
+            checkpoint = state.get("resume_from_checkpoint")
+            if not (
+                config.enabled
+                and exc.returncode in {1, config.exit_code}
+                and state.get("status") == "collapse_detected"
+                and restart_count == previous_count + 1
+                and restart_count <= config.max_restarts
+                and checkpoint
+                and checkpoint_is_resumable(checkpoint)
+            ):
+                raise
+            print(f"[CollapseMonitor] Restart {restart_count}/{config.max_restarts} from {checkpoint}", flush=True)
+
+
+def distributed_active():
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
 
 
 def run_training_with_monitor(
@@ -120,10 +164,22 @@ def run_training_with_monitor(
         if config.enabled:
             monitor_callback.mark_completed()
     except CollapseMonitorFinalize as exc:
+        save_error = [None]
         if is_main_process:
             print(str(exc))
-            if finalize_on_collapse is not None:
+            try:
+                if finalize_on_collapse is None:
+                    raise RuntimeError("No monitor checkpoint finalizer was configured.")
                 finalize_on_collapse(exc.checkpoint_path)
+            except Exception as save_exc:
+                save_error[0] = f"{type(save_exc).__name__}: {save_exc}"
+        if distributed_active():
+            torch.distributed.broadcast_object_list(save_error, src=0)
+        if save_error[0] is not None:
+            if is_main_process and finish_on_exit is not None:
+                finish_on_exit(1)
+            raise RuntimeError(f"Monitor checkpoint finalization failed: {save_error[0]}")
+        if is_main_process:
             if finish_on_exit is not None:
                 finish_on_exit(0)
         sys.exit(0)
@@ -248,10 +304,8 @@ class CollapseMonitorCallback(TrainerCallback):
             self.last_unhealthy_step = None
 
     def _scan_existing_checkpoints(self):
-        for checkpoint_path in glob.glob(os.path.join(self.adapter_dir, "checkpoint-*")):
-            step = checkpoint_step(checkpoint_path)
-            if step is not None:
-                self._register_checkpoint(step, checkpoint_path)
+        for step, checkpoint_path in find_checkpoints(self.adapter_dir):
+            self._register_checkpoint(step, checkpoint_path)
 
     def _register_checkpoint(self, step, path):
         path = os.path.abspath(path)
@@ -274,7 +328,7 @@ class CollapseMonitorCallback(TrainerCallback):
                 continue
             if self.last_unhealthy_step is not None and self.last_unhealthy_step >= step:
                 continue
-            if not os.path.isdir(item["path"]):
+            if not checkpoint_is_resumable(item["path"]):
                 continue
 
             stable_item = {
@@ -292,28 +346,28 @@ class CollapseMonitorCallback(TrainerCallback):
         min_step = current_step - self.rollback_margin_steps
         stable_existing = [
             item for item in self.stable_checkpoints
-            if item.get("step", -1) <= min_step and os.path.isdir(item.get("path", ""))
+            if item.get("step", -1) <= min_step and checkpoint_is_resumable(item.get("path", ""))
         ]
         if stable_existing:
             return max(stable_existing, key=lambda item: item["step"])
 
         stable_existing = [
             item for item in self.stable_checkpoints
-            if item.get("step", -1) < current_step and os.path.isdir(item.get("path", ""))
+            if item.get("step", -1) < current_step and checkpoint_is_resumable(item.get("path", ""))
         ]
         if stable_existing:
             return max(stable_existing, key=lambda item: item["step"])
 
         candidate_existing = [
             item for item in self.candidate_checkpoints
-            if item.get("step", -1) <= min_step and os.path.isdir(item.get("path", ""))
+            if item.get("step", -1) <= min_step and checkpoint_is_resumable(item.get("path", ""))
         ]
         if candidate_existing:
             return max(candidate_existing, key=lambda item: item["step"])
 
         candidate_existing = [
             item for item in self.candidate_checkpoints
-            if item.get("step", -1) < current_step and os.path.isdir(item.get("path", ""))
+            if item.get("step", -1) < current_step and checkpoint_is_resumable(item.get("path", ""))
         ]
         return max(candidate_existing, key=lambda item: item["step"]) if candidate_existing else None
 
@@ -357,7 +411,7 @@ class CollapseMonitorCallback(TrainerCallback):
         self._write_state(status="completed")
 
     def on_save(self, args, state, control, **kwargs):
-        if not self.enabled:
+        if not self.enabled or not self.is_main_process:
             return control
         step = int(state.global_step or 0)
         if step <= 0:
@@ -370,6 +424,35 @@ class CollapseMonitorCallback(TrainerCallback):
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if not self.enabled:
+            return control
+        if not distributed_active():
+            return self._on_log_main(args, state, control, logs=logs, **kwargs)
+        decision = [None]
+        if self.is_main_process:
+            try:
+                self._on_log_main(args, state, control, logs=logs, **kwargs)
+            except CollapseMonitorFinalize as exc:
+                decision[0] = ("finalize", str(exc), exc.checkpoint_path)
+            except CollapseMonitorTriggered as exc:
+                decision[0] = ("restart", str(exc), None)
+            except CollapseMonitorFailed as exc:
+                decision[0] = ("failed", str(exc), None)
+            except Exception as exc:
+                decision[0] = ("error", f"{type(exc).__name__}: {exc}", None)
+        torch.distributed.broadcast_object_list(decision, src=0)
+        if decision[0] is not None:
+            action, message, checkpoint = decision[0]
+            if action == "finalize":
+                raise CollapseMonitorFinalize(message, checkpoint)
+            if action == "restart":
+                raise CollapseMonitorTriggered(message)
+            if action == "failed":
+                raise CollapseMonitorFailed(message)
+            raise RuntimeError(f"Collapse monitor failed: {message}")
+        return control
+
+    def _on_log_main(self, args, state, control, logs=None, **kwargs):
+        if not self.enabled or not self.is_main_process:
             return control
         logs = logs or {}
         step = int(state.global_step or 0)

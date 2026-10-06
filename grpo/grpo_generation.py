@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 import torch
+from jinja2 import TemplateError
 
 from common import config as cfg
 
@@ -33,15 +34,31 @@ def format_prompt(plain_prompt, tokenizer, system_prompt=SYSTEM_PROMPT_STORY):
         {"role": "user", "content": plain_prompt},
     ]
     if getattr(tokenizer, "chat_template", None):
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        try:
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except (TemplateError, ValueError) as exc:
+            message = str(exc).lower()
+            if not any(text in message for text in ("system role", "system message", "roles must alternate")):
+                raise
+            messages = [{"role": "user", "content": f"{system_prompt}\n\n{plain_prompt}"}]
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     return f"{system_prompt}\n\nPrompt:\n{plain_prompt}\n\nStory:\n"
 
 
 def get_generation_eos_token_id(model, tokenizer):
     generation_config = getattr(model, "generation_config", None)
-    if generation_config is not None and getattr(generation_config, "eos_token_id", None) is not None:
-        return generation_config.eos_token_id
-    return tokenizer.eos_token_id
+    configured_eos = getattr(generation_config, "eos_token_id", None)
+    if configured_eos is None:
+        configured_eos = getattr(getattr(model, "config", None), "eos_token_id", None)
+    eos_token_ids = []
+    for value in (configured_eos, getattr(tokenizer, "eos_token_id", None)):
+        values = value if isinstance(value, (list, tuple)) else [value]
+        for token_id in values:
+            if token_id is not None and token_id not in eos_token_ids:
+                eos_token_ids.append(token_id)
+    if not eos_token_ids:
+        return None
+    return eos_token_ids[0] if len(eos_token_ids) == 1 else eos_token_ids
 
 
 def generate_outputs(model, tokenizer, formatted_prompts, plain_prompts, label, settings, seed_fn=None):

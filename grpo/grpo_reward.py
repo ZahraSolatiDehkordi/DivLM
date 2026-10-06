@@ -88,8 +88,8 @@ def has_meta_commentary(text):
         r'(?i)Would love to hear your thoughts',
         r'(?i)Is there anything else I can help you with',
         r'(?i)Can I help you with something else',
-        r"(?i)I can't help you with that",
-        r"(?i)I can't provide information"
+        r"(?i)I can['\u2019]t help you with that",
+        r"(?i)I can['\u2019]t provide information"
     ]
 
     for pattern in meta_patterns:
@@ -238,8 +238,6 @@ class FinalReward:
             if self.use_length_penalty
             else np.zeros(n, dtype=np.float32)
         )
-        r_qual_rewards = r_qual_rewards - p_len
-
         malformed_mask = (
             degenerate_mask
             | (coherence_scores == 0.0)
@@ -370,6 +368,7 @@ class FinalReward:
             r_qual_rewards + r_div_rewards,
             r_qual_rewards
         )
+        r_total_rewards = np.where(malformed_mask, self.invalid_r_qual, r_total_rewards - p_len)
 
         self.component_stats = {
             "train/quality_reward": float(r_qual_rewards.mean()),
