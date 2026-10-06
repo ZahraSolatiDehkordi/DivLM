@@ -1,6 +1,6 @@
 # Improving Diversity in LLM Short Story Generation (DivLM)
 
-This repository contains the implementation of the paper "Improving Diversity in LLM Short Story Generation".
+This repository contains the implementation of the paper ["Improving Diversity in LLM Short Story Generation"](https://arxiv.org/abs/2610.06729) by Zahra Solati Dehkordi and Vasileios Lampos.
 
 ## Structure
 
